@@ -1,4 +1,4 @@
-name: yyjson AFL++ 1h parallel fuzzing with coverage
+name: yyjson AFL++ 5h parallel fuzzing with coverage
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  afl-1h-parallel-coverage:
+  afl-5h-parallel-coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -122,7 +122,7 @@ jobs:
           echo "Input corpus file count:"
           find "$GITHUB_WORKSPACE/corpus/input" -type f | wc -l
 
-      - name: Run AFL++ 1h parallel fuzzing
+      - name: Run AFL++ 5h parallel fuzzing
         id: fuzz
         continue-on-error: true
         run: |
@@ -464,7 +464,7 @@ jobs:
 
           AFL_OUT="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_out"
           ESSENTIAL_DIR="$GITHUB_WORKSPACE/results/essential"
-          ESSENTIAL_TAR="$GITHUB_WORKSPACE/results/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_parallel_1h_essential.tar.gz"
+          ESSENTIAL_TAR="$GITHUB_WORKSPACE/results/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_parallel_5h_essential.tar.gz"
 
           echo "===== AFL++ output directory ====="
           echo "$AFL_OUT"
@@ -621,7 +621,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/coverage-results"
 
           {
-            echo "yyjson AFL++ 1h parallel fuzzing with source coverage"
+            echo "yyjson AFL++ 5h parallel fuzzing with source coverage"
             echo
             echo "AFL duration seconds: $AFL_DURATION_SECONDS"
             echo "AFL queue generation sanitizer: ${{ inputs.sanitizer }}"
@@ -644,7 +644,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: yyjson-incr-afl-${{ inputs.sanitizer }}-parallel-1h-coverage
+          name: yyjson-incr-afl-${{ inputs.sanitizer }}-parallel-5h-coverage
           path: |
             logs
             results/*essential.tar.gz
