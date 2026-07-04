@@ -1,0 +1,147 @@
+name: yyjson AFL++ 10m fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      sanitizer:
+        description: "Sanitizer"
+        required: true
+        default: "address"
+        type: choice
+        options:
+          - address
+          - undefined
+
+permissions:
+  contents: read
+
+jobs:
+  afl-fuzz-10m:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout experiment repository
+        uses: actions/checkout@v4
+        with:
+          path: experiment
+
+      - name: Checkout OSS-Fuzz
+        uses: actions/checkout@v4
+        with:
+          repository: google/oss-fuzz
+          path: oss-fuzz
+
+      - name: Checkout yyjson
+        uses: actions/checkout@v4
+        with:
+          repository: ibireme/yyjson
+          path: yyjson-local
+
+      - name: Add incremental reader fuzz target
+        run: |
+          cp experiment/fuzz/incr_fuzzer.c yyjson-local/fuzz/incr_fuzzer.c
+          ls -lh yyjson-local/fuzz/incr_fuzzer.c
+
+      - name: Patch OSS-Fuzz yyjson build.sh
+        run: |
+          cat >> oss-fuzz/projects/yyjson/build.sh <<'EOF'
+
+          # Build the incremental reader fuzz target.
+          $CC $CFLAGS -I src -c fuzz/incr_fuzzer.c -o incr_fuzzer.o
+          $CXX $CXXFLAGS incr_fuzzer.o -o $OUT/yyjson_incr_fuzzer \
+            $LIB_FUZZING_ENGINE build/libyyjson.a
+
+          cp fuzz/fuzzer.dict $OUT/yyjson_incr_fuzzer.dict
+          zip -jq $OUT/yyjson_incr_fuzzer_seed_corpus.zip /tmp/yyjson_corpus/*
+          EOF
+
+          echo "===== patched build.sh ====="
+          tail -n 20 oss-fuzz/projects/yyjson/build.sh
+
+      - name: Build OSS-Fuzz image
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_image yyjson
+
+      - name: Build fuzzers with AFL++
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            --clean \
+            yyjson "$GITHUB_WORKSPACE/yyjson-local"
+
+      - name: Check AFL++ build
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py check_build \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            yyjson yyjson_incr_fuzzer
+
+      - name: Run AFL++ fuzzing for 10 minutes
+        id: fuzz
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/corpus"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+          cd oss-fuzz
+
+          set +e
+          python3 infra/helper.py run_fuzzer \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            --corpus-dir="$GITHUB_WORKSPACE/corpus" \
+            yyjson yyjson_incr_fuzzer \
+            -V 600 \
+            -m 4096 \
+            2>&1 | tee "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_10m.log"
+
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$GITHUB_WORKSPACE/logs/exit_status.txt"
+
+          if [ "$status" -ne 0 ]; then
+            echo "crash_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "crash_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit 0
+
+      - name: Collect AFL++ findings
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/afl-output"
+
+          echo "Searching for AFL++ output directories..."
+          find oss-fuzz/build -maxdepth 5 -type d \( -name crashes -o -name hangs -o -name queue \) -print || true
+
+          echo "Copying possible AFL++ findings..."
+          find oss-fuzz/build -type d -name crashes -exec sh -c 'mkdir -p "$0/crashes"; cp -a "$1"/. "$0/crashes/" 2>/dev/null || true' "$GITHUB_WORKSPACE/afl-output" {} \;
+          find oss-fuzz/build -type d -name hangs -exec sh -c 'mkdir -p "$0/hangs"; cp -a "$1"/. "$0/hangs/" 2>/dev/null || true' "$GITHUB_WORKSPACE/afl-output" {} \;
+          find oss-fuzz/build -type d -name queue -exec sh -c 'mkdir -p "$0/queue"; cp -a "$1"/. "$0/queue/" 2>/dev/null || true' "$GITHUB_WORKSPACE/afl-output" {} \;
+
+          echo "AFL++ output summary:"
+          find "$GITHUB_WORKSPACE/afl-output" -type f | head -100 || true
+          find "$GITHUB_WORKSPACE/afl-output" -type f | wc -l || true
+
+      - name: Upload fuzzing results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yyjson-incr-afl-${{ inputs.sanitizer }}-10m-results
+          path: |
+            corpus
+            logs
+            afl-output
+          retention-days: 7
+
+      - name: Fail if AFL++ reported an abnormal exit
+        if: steps.fuzz.outputs.crash_found == 'true'
+        run: |
+          echo "AFL++ or sanitizer returned non-zero. Check uploaded logs and AFL++ output."
+          exit 1
