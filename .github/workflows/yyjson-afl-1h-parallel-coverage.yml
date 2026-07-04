@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 180
 
     env:
-      AFL_DURATION_SECONDS: 160
+      AFL_DURATION_SECONDS: 3600
       NEW_TARGET: yyjson_incr_fuzzer
       EXISTING_TARGET: fuzzer
 
