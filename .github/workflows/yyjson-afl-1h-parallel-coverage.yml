@@ -371,7 +371,7 @@ jobs:
 
           if [ ! -d "$RAW_QUEUE" ] || [ "$(find "$RAW_QUEUE" -type f | wc -l)" -eq 0 ]; then
             echo "No raw queue files. Falling back to original input corpus."
-			exit 1
+            exit 1
           else
             docker run \
               --privileged \
