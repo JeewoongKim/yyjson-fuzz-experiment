@@ -87,6 +87,9 @@ jobs:
           echo "===== fuzzer binary ====="
           ls -lh oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer
 
+          echo "===== afl-fuzz binary ====="
+          ls -lh oss-fuzz/build/out/yyjson/afl-fuzz
+
           echo "===== dictionary ====="
           ls -lh oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer.dict
 
@@ -101,73 +104,168 @@ jobs:
             --sanitizer=${{ inputs.sanitizer }} \
             yyjson yyjson_incr_fuzzer
 
+      - name: Prepare AFL++ input corpus
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/corpus/input"
+
+          unzip -oq \
+            "$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer_seed_corpus.zip" \
+            -d "$GITHUB_WORKSPACE/corpus/input"
+
+          echo "===== input corpus ====="
+          find "$GITHUB_WORKSPACE/corpus/input" -type f | head -50
+          echo "Input corpus file count:"
+          find "$GITHUB_WORKSPACE/corpus/input" -type f | wc -l
+
       - name: Run AFL++ parallel fuzzing
         id: fuzz
         continue-on-error: true
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/corpus/main"
-          mkdir -p "$GITHUB_WORKSPACE/corpus/secondary01"
-          mkdir -p "$GITHUB_WORKSPACE/corpus/secondary02"
           mkdir -p "$GITHUB_WORKSPACE/logs"
-
-          cd oss-fuzz
-
-          run_afl_instance() {
-            local name="$1"
-            local mode_flag="$2"
-            local mode_name="$3"
-            local corpus_dir="$GITHUB_WORKSPACE/corpus/$name"
-            local log_path="$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_${name}_6h.log"
-            local status_path="$GITHUB_WORKSPACE/logs/exit_status_${name}.txt"
-
-            echo "===== starting AFL++ instance: ${name} (${mode_flag} ${mode_name}) ====="
-
-            set +e
-            python3 infra/helper.py run_fuzzer \
-              --engine afl \
-              --sanitizer=${{ inputs.sanitizer }} \
-              -e AFL_NO_UI=1 \
-              --corpus-dir="$corpus_dir" \
-              yyjson yyjson_incr_fuzzer \
-              -- \
-              -V "$AFL_DURATION_SECONDS" \
-              "$mode_flag" "$mode_name" \
-              2>&1 | tee "$log_path"
-
-            local status=${PIPESTATUS[0]}
-            echo "$status" > "$status_path"
-            echo "===== AFL++ instance ${name} exited with status ${status} ====="
-            return "$status"
-          }
 
           set +e
 
-          run_afl_instance "main" "-M" "main" &
-          pid_main=$!
+          docker run \
+            --privileged \
+            --shm-size=2g \
+            --platform linux/amd64 \
+            --rm \
+            -e AFL_SANITIZER="${{ inputs.sanitizer }}" \
+            -e AFL_DURATION_SECONDS="$AFL_DURATION_SECONDS" \
+            -e AFL_NO_UI=1 \
+            -e AFL_SKIP_CPUFREQ=1 \
+            -e AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
+            -e AFL_TRY_AFFINITY=1 \
+            -e AFL_IGNORE_UNKNOWN_ENVS=1 \
+            -e AFL_CMPLOG_ONLY_NEW=1 \
+            -e AFL_FAST_CAL=1 \
+            -e AFL_IGNORE_PROBLEMS=1 \
+            -e AFL_FORKSRV_INIT_TMOUT=30000 \
+            -e ASAN_OPTIONS="alloc_dealloc_mismatch=0:allocator_may_return_null=1:allocator_release_to_os_interval_ms=500:check_malloc_usable_size=0:detect_container_overflow=1:detect_odr_violation=0:detect_leaks=1:detect_stack_use_after_return=1:fast_unwind_on_fatal=0:handle_abort=1:handle_segv=1:handle_sigill=1:max_uar_stack_size_log=16:print_scariness=1:quarantine_size_mb=10:strict_memcmp=1:strip_path_prefix=/workspace/:symbolize=0:use_sigaltstack=1:dedup_token_length=3:abort_on_error=1" \
+            -e UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1:symbolize=0:strip_path_prefix=/workspace/:dedup_token_length=3" \
+            -v "$GITHUB_WORKSPACE/corpus/input:/corpus/input:ro" \
+            -v "$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson:/out" \
+            gcr.io/oss-fuzz-base/base-runner:latest \
+            /bin/bash -lc '
+              set +e
 
-          # Let the main node initialize the shared AFL++ output directory first.
-          sleep 20
+              AFL_OUT="/out/yyjson_incr_fuzzer_afl_${AFL_SANITIZER}_out"
+              AFL_LOG_DIR="/out/yyjson_incr_fuzzer_afl_${AFL_SANITIZER}_logs"
 
-          run_afl_instance "secondary01" "-S" "secondary01" &
-          pid_secondary01=$!
+              echo "===== clean previous AFL++ output once ====="
+              rm -rf "$AFL_OUT" "$AFL_LOG_DIR"
+              mkdir -p "$AFL_OUT" "$AFL_LOG_DIR"
 
-          run_afl_instance "secondary02" "-S" "secondary02" &
-          pid_secondary02=$!
+              echo "===== AFL++ parallel configuration ====="
+              echo "AFL_OUT=$AFL_OUT"
+              echo "AFL_LOG_DIR=$AFL_LOG_DIR"
+              echo "AFL_DURATION_SECONDS=$AFL_DURATION_SECONDS"
+              echo "AFL_SANITIZER=$AFL_SANITIZER"
 
-          wait "$pid_main"
-          status_main=$?
+              echo "===== target files ====="
+              ls -lh /out/yyjson_incr_fuzzer
+              ls -lh /out/afl-fuzz
+              ls -lh /out/yyjson_incr_fuzzer.dict
+              echo "Input corpus count:"
+              find /corpus/input -type f | wc -l
 
-          wait "$pid_secondary01"
-          status_secondary01=$?
+              echo "===== starting main ====="
+              (
+                set +e
+                /out/afl-fuzz \
+                  -t 5000+ \
+                  -i /corpus/input \
+                  -o "$AFL_OUT" \
+                  -x /out/yyjson_incr_fuzzer.dict \
+                  -V "$AFL_DURATION_SECONDS" \
+                  -M main \
+                  -- /out/yyjson_incr_fuzzer \
+                  2>&1 | tee "$AFL_LOG_DIR/main.log"
+              
+                exit "${PIPESTATUS[0]}"
+              ) &
+              pid_main=$!
 
-          wait "$pid_secondary02"
-          status_secondary02=$?
+              sleep 20
 
-          echo "main=$status_main" | tee "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt"
-          echo "secondary01=$status_secondary01" | tee -a "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt"
-          echo "secondary02=$status_secondary02" | tee -a "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt"
+              echo "===== starting secondary01 ====="
+              (
+                set +e
+                /out/afl-fuzz \
+                  -t 5000+ \
+                  -i /corpus/input \
+                  -o "$AFL_OUT" \
+                  -x /out/yyjson_incr_fuzzer.dict \
+                  -V "$AFL_DURATION_SECONDS" \
+                  -S secondary01 \
+                  -- /out/yyjson_incr_fuzzer \
+                  > "$AFL_LOG_DIR/secondary01.log" 2>&1
+              
+                exit "$?"
+              ) &
+              pid_secondary01=$!
+              
+              echo "===== starting secondary02 ====="
+              (
+                set +e
+                /out/afl-fuzz \
+                  -t 5000+ \
+                  -i /corpus/input \
+                  -o "$AFL_OUT" \
+                  -x /out/yyjson_incr_fuzzer.dict \
+                  -V "$AFL_DURATION_SECONDS" \
+                  -S secondary02 \
+                  -- /out/yyjson_incr_fuzzer \
+                  > "$AFL_LOG_DIR/secondary02.log" 2>&1
+              
+                exit "$?"
+              ) &
+              pid_secondary02=$!
 
-          if [ "$status_main" -ne 0 ] || [ "$status_secondary01" -ne 0 ] || [ "$status_secondary02" -ne 0 ]; then
+              wait "$pid_main"
+              status_main=$?
+
+              wait "$pid_secondary01"
+              status_secondary01=$?
+
+              wait "$pid_secondary02"
+              status_secondary02=$?
+
+              echo "main=$status_main" | tee "$AFL_LOG_DIR/parallel_exit_summary.txt"
+              echo "secondary01=$status_secondary01" | tee -a "$AFL_LOG_DIR/parallel_exit_summary.txt"
+              echo "secondary02=$status_secondary02" | tee -a "$AFL_LOG_DIR/parallel_exit_summary.txt"
+
+              echo "===== AFL++ output tree ====="
+              find "$AFL_OUT" -maxdepth 3 -type d | sort || true
+
+              exit 0
+            '
+
+          docker_status=$?
+          echo "docker_status=$docker_status" | tee "$GITHUB_WORKSPACE/logs/docker_status.txt"
+
+          AFL_LOG_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer_afl_${{ inputs.sanitizer }}_logs"
+
+          if [ -d "$AFL_LOG_DIR" ]; then
+            cp "$AFL_LOG_DIR"/*.log "$GITHUB_WORKSPACE/logs/" 2>/dev/null || true
+            cp "$AFL_LOG_DIR"/parallel_exit_summary.txt "$GITHUB_WORKSPACE/logs/" 2>/dev/null || true
+          fi
+
+          status_main=1
+          status_secondary01=1
+          status_secondary02=1
+
+          if [ -f "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" ]; then
+            status_main=$(grep "^main=" "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" | cut -d= -f2)
+            status_secondary01=$(grep "^secondary01=" "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" | cut -d= -f2)
+            status_secondary02=$(grep "^secondary02=" "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" | cut -d= -f2)
+          fi
+
+          echo "main=$status_main"
+          echo "secondary01=$status_secondary01"
+          echo "secondary02=$status_secondary02"
+
+          if [ "$docker_status" -ne 0 ] || [ "$status_main" -ne 0 ] || [ "$status_secondary01" -ne 0 ] || [ "$status_secondary02" -ne 0 ]; then
             echo "afl_status=failed" >> "$GITHUB_OUTPUT"
           else
             echo "afl_status=success" >> "$GITHUB_OUTPUT"
@@ -192,15 +290,18 @@ jobs:
           echo "===== parallel exit summary ====="
           cat "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" || true
 
+          echo "===== docker status ====="
+          cat "$GITHUB_WORKSPACE/logs/docker_status.txt" || true
+
           echo "===== log tails ====="
           echo "--- main ---"
-          tail -n 80 "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_main_6h.log" || true
+          tail -n 100 "$GITHUB_WORKSPACE/logs/main.log" || true
 
           echo "--- secondary01 ---"
-          tail -n 80 "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_secondary01_6h.log" || true
+          tail -n 100 "$GITHUB_WORKSPACE/logs/secondary01.log" || true
 
           echo "--- secondary02 ---"
-          tail -n 80 "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_secondary02_6h.log" || true
+          tail -n 100 "$GITHUB_WORKSPACE/logs/secondary02.log" || true
 
           if [ -d "$AFL_OUT" ]; then
             echo "Found AFL++ output directory."
@@ -220,7 +321,7 @@ jobs:
             echo "crash_count=$crash_count" >> "$GITHUB_OUTPUT"
             echo "hang_count=$hang_count" >> "$GITHUB_OUTPUT"
 
-            echo "===== collect fuzzer_stats, plot_data, crashes, hangs ====="
+            echo "===== collect fuzzer_stats, plot_data, crashes, hangs, fastresume.bin ====="
 
             for inst in "$AFL_OUT"/*; do
               if [ -d "$inst" ]; then
@@ -228,11 +329,15 @@ jobs:
                 mkdir -p "$ESSENTIAL_DIR/$inst_name"
 
                 if [ -f "$inst/fuzzer_stats" ]; then
-                  cp "$inst/fuzzer_stats" "$ESSENTIAL_DIR/$inst_name/fuzzer_stats"
+                  sudo cp "$inst/fuzzer_stats" "$ESSENTIAL_DIR/$inst_name/fuzzer_stats"
                 fi
 
                 if [ -f "$inst/plot_data" ]; then
-                  cp "$inst/plot_data" "$ESSENTIAL_DIR/$inst_name/plot_data"
+                  sudo cp "$inst/plot_data" "$ESSENTIAL_DIR/$inst_name/plot_data"
+                fi
+
+                if [ -f "$inst/fastresume.bin" ]; then
+                  sudo cp "$inst/fastresume.bin" "$ESSENTIAL_DIR/$inst_name/fastresume.bin"
                 fi
 
                 if [ -d "$inst/crashes" ]; then
@@ -249,6 +354,7 @@ jobs:
 
             cp "$GITHUB_WORKSPACE/logs/finding_summary.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
             cp "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
+            cp "$GITHUB_WORKSPACE/logs/docker_status.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
 
             sudo chown -R "$USER:$USER" "$ESSENTIAL_DIR"
 
