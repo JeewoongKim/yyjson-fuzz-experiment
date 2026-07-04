@@ -73,6 +73,14 @@ jobs:
             --clean \
             yyjson "$GITHUB_WORKSPACE/yyjson-local"
 
+      - name: Show build output
+        run: |
+          echo "===== build/out/yyjson ====="
+          ls -lh oss-fuzz/build/out/yyjson
+
+          echo "===== seed corpus zip ====="
+          ls -lh oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer_seed_corpus.zip
+
       - name: Check AFL++ build
         run: |
           cd oss-fuzz
@@ -86,7 +94,6 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p "$GITHUB_WORKSPACE/corpus"
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
           mkdir -p "$GITHUB_WORKSPACE/logs"
 
           cd oss-fuzz
@@ -95,39 +102,53 @@ jobs:
           python3 infra/helper.py run_fuzzer \
             --engine afl \
             --sanitizer=${{ inputs.sanitizer }} \
+            -e AFL_NO_UI=1 \
+            -e AFL_FUZZER_ARGS= \
             --corpus-dir="$GITHUB_WORKSPACE/corpus" \
             yyjson yyjson_incr_fuzzer \
+            -- \
             -V 600 \
-            -m 4096 \
             2>&1 | tee "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_10m.log"
 
           status=${PIPESTATUS[0]}
           echo "$status" > "$GITHUB_WORKSPACE/logs/exit_status.txt"
 
           if [ "$status" -ne 0 ]; then
-            echo "crash_found=true" >> "$GITHUB_OUTPUT"
+            echo "afl_status=failed" >> "$GITHUB_OUTPUT"
           else
-            echo "crash_found=false" >> "$GITHUB_OUTPUT"
+            echo "afl_status=success" >> "$GITHUB_OUTPUT"
           fi
 
           exit 0
 
-      - name: Collect AFL++ findings
+      - name: Collect AFL++ output
         if: always()
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/afl-output"
+          mkdir -p "$GITHUB_WORKSPACE/results"
 
-          echo "Searching for AFL++ output directories..."
-          find oss-fuzz/build -maxdepth 5 -type d \( -name crashes -o -name hangs -o -name queue \) -print || true
+          echo "===== corpus after fuzzing ====="
+          find "$GITHUB_WORKSPACE/corpus" -type f | head -100 || true
+          find "$GITHUB_WORKSPACE/corpus" -type f | wc -l || true
 
-          echo "Copying possible AFL++ findings..."
-          find oss-fuzz/build -type d -name crashes -exec sh -c 'mkdir -p "$0/crashes"; cp -a "$1"/. "$0/crashes/" 2>/dev/null || true' "$GITHUB_WORKSPACE/afl-output" {} \;
-          find oss-fuzz/build -type d -name hangs -exec sh -c 'mkdir -p "$0/hangs"; cp -a "$1"/. "$0/hangs/" 2>/dev/null || true' "$GITHUB_WORKSPACE/afl-output" {} \;
-          find oss-fuzz/build -type d -name queue -exec sh -c 'mkdir -p "$0/queue"; cp -a "$1"/. "$0/queue/" 2>/dev/null || true' "$GITHUB_WORKSPACE/afl-output" {} \;
+          echo "===== AFL++ output directories ====="
+          find oss-fuzz/build/out/yyjson -maxdepth 2 -type d -name "*_afl_${{ inputs.sanitizer }}_out" -print || true
 
-          echo "AFL++ output summary:"
-          find "$GITHUB_WORKSPACE/afl-output" -type f | head -100 || true
-          find "$GITHUB_WORKSPACE/afl-output" -type f | wc -l || true
+          AFL_OUT="oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer_afl_${{ inputs.sanitizer }}_out"
+
+          if [ -d "$AFL_OUT" ]; then
+            echo "Found AFL output: $AFL_OUT"
+            cp -a "$AFL_OUT" "$GITHUB_WORKSPACE/results/afl-output"
+          else
+            echo "AFL output directory not found: $AFL_OUT"
+            echo "Dumping build/out/yyjson:"
+            find oss-fuzz/build/out/yyjson -maxdepth 3 -print || true
+          fi
+
+          echo "===== crash files ====="
+          find "$GITHUB_WORKSPACE/results" -path "*/crashes/*" -type f || true
+
+          echo "===== hang files ====="
+          find "$GITHUB_WORKSPACE/results" -path "*/hangs/*" -type f || true
 
       - name: Upload fuzzing results
         if: always()
@@ -137,11 +158,11 @@ jobs:
           path: |
             corpus
             logs
-            afl-output
+            results
           retention-days: 7
 
-      - name: Fail if AFL++ reported an abnormal exit
-        if: steps.fuzz.outputs.crash_found == 'true'
+      - name: Fail if AFL++ returned non-zero
+        if: steps.fuzz.outputs.afl_status == 'failed'
         run: |
-          echo "AFL++ or sanitizer returned non-zero. Check uploaded logs and AFL++ output."
+          echo "AFL++ or sanitizer returned non-zero. Check uploaded logs and results."
           exit 1
