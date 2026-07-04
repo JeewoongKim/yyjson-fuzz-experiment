@@ -406,7 +406,7 @@ jobs:
                   echo "Using afl-cmin for coverage-equivalent corpus minimization."
 
                   /out/afl-cmin \
-                    -t 5000+ \
+                    -t 5000 \
                     -i /raw_queue \
                     -o /min_corpus \
                     -- "/out/$NEW_TARGET"
