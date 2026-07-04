@@ -1,0 +1,295 @@
+name: yyjson AFL++ 6h parallel fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      sanitizer:
+        description: "Sanitizer"
+        required: true
+        default: "address"
+        type: choice
+        options:
+          - address
+          - undefined
+
+permissions:
+  contents: read
+
+jobs:
+  afl-fuzz-6h-parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      AFL_DURATION_SECONDS: 20400
+
+    steps:
+      - name: Checkout experiment repository
+        uses: actions/checkout@v4
+        with:
+          path: experiment
+
+      - name: Checkout OSS-Fuzz
+        uses: actions/checkout@v4
+        with:
+          repository: google/oss-fuzz
+          path: oss-fuzz
+
+      - name: Checkout yyjson
+        uses: actions/checkout@v4
+        with:
+          repository: ibireme/yyjson
+          path: yyjson-local
+
+      - name: Add incremental reader fuzz target
+        run: |
+          cp experiment/fuzz/incr_fuzzer.c yyjson-local/fuzz/incr_fuzzer.c
+          ls -lh yyjson-local/fuzz/incr_fuzzer.c
+
+      - name: Patch OSS-Fuzz yyjson build.sh
+        run: |
+          cat >> oss-fuzz/projects/yyjson/build.sh <<'EOF'
+
+          # Build the incremental reader fuzz target.
+          $CC $CFLAGS -I src -c fuzz/incr_fuzzer.c -o incr_fuzzer.o
+          $CXX $CXXFLAGS incr_fuzzer.o -o $OUT/yyjson_incr_fuzzer \
+            $LIB_FUZZING_ENGINE build/libyyjson.a
+
+          # Reuse yyjson's existing JSON dictionary for the new target.
+          cp fuzz/fuzzer.dict $OUT/yyjson_incr_fuzzer.dict
+
+          # Reuse yyjson's existing seed corpus.
+          zip -jq $OUT/yyjson_incr_fuzzer_seed_corpus.zip /tmp/yyjson_corpus/*
+          EOF
+
+          echo "===== patched build.sh ====="
+          tail -n 25 oss-fuzz/projects/yyjson/build.sh
+
+      - name: Build OSS-Fuzz image
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_image --pull yyjson
+
+      - name: Build fuzzers with AFL++
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            --clean \
+            yyjson "$GITHUB_WORKSPACE/yyjson-local"
+
+      - name: Show build output
+        run: |
+          echo "===== build/out/yyjson ====="
+          ls -lh oss-fuzz/build/out/yyjson
+
+          echo "===== fuzzer binary ====="
+          ls -lh oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer
+
+          echo "===== dictionary ====="
+          ls -lh oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer.dict
+
+          echo "===== seed corpus zip ====="
+          ls -lh oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer_seed_corpus.zip
+
+      - name: Check AFL++ build
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py check_build \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            yyjson yyjson_incr_fuzzer
+
+      - name: Run AFL++ parallel fuzzing
+        id: fuzz
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/corpus"
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+          cd oss-fuzz
+
+          run_afl_instance() {
+            local name="$1"
+            local mode_flag="$2"
+            local mode_name="$3"
+            local log_path="$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_${name}_6h.log"
+            local status_path="$GITHUB_WORKSPACE/logs/exit_status_${name}.txt"
+
+            echo "===== starting AFL++ instance: ${name} (${mode_flag} ${mode_name}) ====="
+
+            set +e
+            python3 infra/helper.py run_fuzzer \
+              --engine afl \
+              --sanitizer=${{ inputs.sanitizer }} \
+              -e AFL_NO_UI=1 \
+              --corpus-dir="$GITHUB_WORKSPACE/corpus" \
+              yyjson yyjson_incr_fuzzer \
+              -- \
+              -V "$AFL_DURATION_SECONDS" \
+              "$mode_flag" "$mode_name" \
+              2>&1 | tee "$log_path"
+
+            local status=${PIPESTATUS[0]}
+            echo "$status" > "$status_path"
+            echo "===== AFL++ instance ${name} exited with status ${status} ====="
+            return "$status"
+          }
+
+          set +e
+
+          run_afl_instance "main" "-M" "main" &
+          pid_main=$!
+
+          # Let the main node initialize the shared AFL++ output directory first.
+          sleep 20
+
+          run_afl_instance "secondary01" "-S" "secondary01" &
+          pid_secondary01=$!
+
+          run_afl_instance "secondary02" "-S" "secondary02" &
+          pid_secondary02=$!
+
+          wait "$pid_main"
+          status_main=$?
+
+          wait "$pid_secondary01"
+          status_secondary01=$?
+
+          wait "$pid_secondary02"
+          status_secondary02=$?
+
+          echo "main=$status_main" | tee "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt"
+          echo "secondary01=$status_secondary01" | tee -a "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt"
+          echo "secondary02=$status_secondary02" | tee -a "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt"
+
+          if [ "$status_main" -ne 0 ] || [ "$status_secondary01" -ne 0 ] || [ "$status_secondary02" -ne 0 ]; then
+            echo "afl_status=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "afl_status=success" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit 0
+
+      - name: Collect AFL++ output
+        id: collect
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results"
+
+          AFL_OUT="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/yyjson_incr_fuzzer_afl_${{ inputs.sanitizer }}_out"
+          OUT_TAR="$GITHUB_WORKSPACE/results/yyjson_incr_fuzzer_afl_${{ inputs.sanitizer }}_parallel_6h_out.tar.gz"
+
+          echo "===== AFL++ output directory ====="
+          echo "$AFL_OUT"
+
+          echo "===== parallel exit summary ====="
+          cat "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" || true
+
+          echo "===== log tails ====="
+          echo "--- main ---"
+          tail -n 80 "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_main_6h.log" || true
+
+          echo "--- secondary01 ---"
+          tail -n 80 "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_secondary01_6h.log" || true
+
+          echo "--- secondary02 ---"
+          tail -n 80 "$GITHUB_WORKSPACE/logs/afl_${{ inputs.sanitizer }}_secondary02_6h.log" || true
+
+          echo "===== corpus directory ====="
+          find "$GITHUB_WORKSPACE/corpus" -type f | head -50 || true
+          echo "Corpus file count:"
+          find "$GITHUB_WORKSPACE/corpus" -type f | wc -l || true
+
+          if [ -d "$AFL_OUT" ]; then
+            echo "Found AFL++ output directory."
+
+            echo "===== AFL++ instance directories ====="
+            find "$AFL_OUT" -maxdepth 2 -type d | sort || true
+
+            echo "===== important AFL++ files ====="
+            find "$AFL_OUT" -maxdepth 4 \( \
+              -name plot_data -o \
+              -name fuzzer_stats -o \
+              -name queue -o \
+              -name crashes -o \
+              -name hangs -o \
+              -name fastresume.bin \
+            \) -print | sort || true
+
+            echo "===== fuzzer_stats files ====="
+            for stats in "$AFL_OUT"/*/fuzzer_stats; do
+              if [ -f "$stats" ]; then
+                echo "--- $stats ---"
+                cat "$stats" || true
+              fi
+            done
+
+            echo "===== plot_data heads ====="
+            for plot in "$AFL_OUT"/*/plot_data; do
+              if [ -f "$plot" ]; then
+                echo "--- $plot ---"
+                head -n 20 "$plot" || true
+              fi
+            done
+
+            echo "===== crash files ====="
+            find "$AFL_OUT" -path "*/crashes/*" -type f ! -name README.txt | sort || true
+
+            echo "===== hang files ====="
+            find "$AFL_OUT" -path "*/hangs/*" -type f ! -name README.txt | sort || true
+
+            crash_count=$(find "$AFL_OUT" -path "*/crashes/*" -type f ! -name README.txt | wc -l | tr -d ' ')
+            hang_count=$(find "$AFL_OUT" -path "*/hangs/*" -type f ! -name README.txt | wc -l | tr -d ' ')
+
+            echo "crash_count=$crash_count" | tee "$GITHUB_WORKSPACE/logs/finding_summary.txt"
+            echo "hang_count=$hang_count" | tee -a "$GITHUB_WORKSPACE/logs/finding_summary.txt"
+
+            echo "crash_count=$crash_count" >> "$GITHUB_OUTPUT"
+            echo "hang_count=$hang_count" >> "$GITHUB_OUTPUT"
+
+            echo "===== creating AFL++ output tarball ====="
+            sudo tar -czf "$OUT_TAR" \
+              -C "$(dirname "$AFL_OUT")" \
+              "$(basename "$AFL_OUT")"
+
+            sudo chown "$USER:$USER" "$OUT_TAR"
+
+            echo "===== created results ====="
+            ls -lh "$GITHUB_WORKSPACE/results"
+          else
+            echo "AFL++ output directory not found."
+
+            echo "crash_count=0" >> "$GITHUB_OUTPUT"
+            echo "hang_count=0" >> "$GITHUB_OUTPUT"
+
+            echo "===== dump build/out/yyjson ====="
+            find "$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson" -maxdepth 4 -print || true
+          fi
+
+      - name: Upload fuzzing results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yyjson-incr-afl-${{ inputs.sanitizer }}-parallel-6h-results
+          path: |
+            corpus
+            logs
+            results
+          retention-days: 7
+
+      - name: Fail if AFL++ returned non-zero
+        if: steps.fuzz.outputs.afl_status == 'failed'
+        run: |
+          echo "At least one AFL++ instance returned non-zero. Check uploaded logs and results."
+          exit 1
+
+      - name: Fail if crashes or hangs were found
+        if: steps.collect.outputs.crash_count != '0' || steps.collect.outputs.hang_count != '0'
+        run: |
+          echo "AFL++ found crashes or hangs."
+          echo "crash_count=${{ steps.collect.outputs.crash_count }}"
+          echo "hang_count=${{ steps.collect.outputs.hang_count }}"
+          echo "Download the uploaded artifact and inspect results/*.tar.gz."
+          exit 1
