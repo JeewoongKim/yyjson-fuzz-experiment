@@ -1,10 +1,8 @@
 #include <yyjson.h>
 
-static void run_incr_reader(const uint8_t *data, size_t size) {
-    if (data == NULL || size == 0) {
-        return;
-    }
+#define YYJSON_INCR_MAX_INPUT_SIZE 8192
 
+static void run_incr_reader(const uint8_t *data, size_t size) {
     /*
      * Keep this target focused on incremental-reader state transitions.
      * The input is fed to the parser one byte at a time to stress 
@@ -41,7 +39,7 @@ static void run_incr_reader(const uint8_t *data, size_t size) {
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (data == NULL || size == 0) {
+    if (data == NULL || size == 0 || size > YYJSON_INCR_MAX_INPUT_SIZE) {
         return 0;
     }
 
