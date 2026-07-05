@@ -194,6 +194,7 @@ jobs:
                   -x "/out/${NEW_TARGET}.dict" \
                   -V "$AFL_DURATION_SECONDS" \
                   -M main \
+                  -G 8192 \
                   -- "/out/$NEW_TARGET" \
                   2>&1 | tee "$AFL_LOG_DIR/main.log"
 
@@ -213,6 +214,7 @@ jobs:
                   -x "/out/${NEW_TARGET}.dict" \
                   -V "$AFL_DURATION_SECONDS" \
                   -S secondary01 \
+                  -G 8192 \
                   -- "/out/$NEW_TARGET" \
                   > "$AFL_LOG_DIR/secondary01.log" 2>&1
 
@@ -230,6 +232,7 @@ jobs:
                   -x "/out/${NEW_TARGET}.dict" \
                   -V "$AFL_DURATION_SECONDS" \
                   -S secondary02 \
+                  -G 8192 \
                   -- "/out/$NEW_TARGET" \
                   > "$AFL_LOG_DIR/secondary02.log" 2>&1
 
