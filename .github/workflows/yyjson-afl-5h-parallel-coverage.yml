@@ -18,7 +18,7 @@ permissions:
 jobs:
   afl-5h-parallel-coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     env:
       AFL_DURATION_SECONDS: 18000
