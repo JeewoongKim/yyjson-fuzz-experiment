@@ -1,0 +1,706 @@
+name: yyjson JSON Merge Patch AFL++ 5h parallel fuzzing with coverage
+
+on:
+  workflow_dispatch:
+    inputs:
+      sanitizer:
+        description: "Sanitizer used for AFL++ queue generation"
+        required: true
+        default: "address"
+        type: choice
+        options:
+          - address
+          - undefined
+
+permissions:
+  contents: read
+
+jobs:
+  afl-5h-parallel-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      AFL_DURATION_SECONDS: 18000
+      MAX_INPUT_SIZE: 8192
+      NEW_TARGET: yyjson_merge_patch_fuzzer
+      EXISTING_TARGET: yyjson_fuzzer
+
+    steps:
+      - name: Checkout experiment repository
+        uses: actions/checkout@v4
+        with:
+          path: experiment
+
+      - name: Checkout OSS-Fuzz
+        uses: actions/checkout@v4
+        with:
+          repository: google/oss-fuzz
+          path: oss-fuzz
+
+      - name: Checkout yyjson
+        uses: actions/checkout@v4
+        with:
+          repository: ibireme/yyjson
+          path: yyjson-local
+
+      - name: Add fuzz target to yyjson checkout
+        run: |
+          cp "experiment/fuzz/merge_patch_fuzzer.c" "yyjson-local/fuzz/merge_patch_fuzzer.c"
+          ls -lh "yyjson-local/fuzz/merge_patch_fuzzer.c"
+
+      - name: Patch OSS-Fuzz yyjson build.sh
+        run: |
+          cat >> oss-fuzz/projects/yyjson/build.sh <<'EOF'
+
+          # Build the JSON Merge Patch fuzz target.
+          $CC $CFLAGS -I src -c fuzz/merge_patch_fuzzer.c -o merge_patch_fuzzer.o
+          $CXX $CXXFLAGS merge_patch_fuzzer.o -o $OUT/yyjson_merge_patch_fuzzer \
+            $LIB_FUZZING_ENGINE build/libyyjson.a
+
+          # Reuse yyjson's existing JSON dictionary for strings, numbers, and JSON syntax.
+          cp fuzz/fuzzer.dict $OUT/yyjson_merge_patch_fuzzer.dict
+
+          # Create a target-specific seed corpus.
+          # The target input format is:
+          #   little-endian uint16 split length || base JSON || JSON Merge Patch JSON
+          mkdir -p /tmp/yyjson_merge_patch_corpus
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          out = Path("/tmp/yyjson_merge_patch_corpus")
+          out.mkdir(parents=True, exist_ok=True)
+
+          seeds = [
+            (
+                b'{"name":"old","unused":1,"obj":{"a":1,"b":2}}',
+                b'{"name":"new","unused":null,"obj":{"b":3,"c":4}}',
+            ),
+            (
+                b'{"a":{"b":{"c":1}},"keep":true}',
+                b'{"a":{"b":{"d":2}}}',
+            ),
+            (
+                b'{"arr":[1,2,3],"obj":{"x":1}}',
+                b'{"arr":[4],"obj":null}',
+            ),
+            (
+                b'{"scalar":1}',
+                b'null',
+            ),
+            (
+                b'{"scalar":1}',
+                b'["replacement"]',
+            ),
+            (
+                b'{"deep":{"x":{"y":{"z":0}}}}',
+                b'{"deep":{"x":{"y":{"z":1,"w":2}}}}',
+            ),
+          ]
+
+          for i, (base, patch) in enumerate(seeds):
+              data = struct.pack("<H", len(base)) + base + patch
+              (out / f"seed_{i}").write_bytes(data)
+          PY
+
+          zip -jq $OUT/yyjson_merge_patch_fuzzer_seed_corpus.zip /tmp/yyjson_merge_patch_corpus/*
+          EOF
+
+          echo "===== patched build.sh ====="
+          tail -n 60 oss-fuzz/projects/yyjson/build.sh
+
+      - name: Build OSS-Fuzz image
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_image --pull yyjson
+
+      - name: Build fuzzers with AFL++
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            --clean \
+            yyjson "$GITHUB_WORKSPACE/yyjson-local"
+
+      - name: Show AFL++ build output
+        run: |
+          echo "===== build/out/yyjson ====="
+          ls -lh oss-fuzz/build/out/yyjson
+
+          echo "===== new fuzzer binary ====="
+          ls -lh "oss-fuzz/build/out/yyjson/$NEW_TARGET"
+
+          echo "===== existing fuzzer binary ====="
+          ls -lh "oss-fuzz/build/out/yyjson/$EXISTING_TARGET" || true
+
+          echo "===== afl-fuzz binary ====="
+          ls -lh oss-fuzz/build/out/yyjson/afl-fuzz
+
+          echo "===== afl-cmin binary, if available ====="
+          ls -lh oss-fuzz/build/out/yyjson/afl-cmin || true
+
+          echo "===== dictionary ====="
+          ls -lh "oss-fuzz/build/out/yyjson/${NEW_TARGET}.dict"
+
+          echo "===== seed corpus zip ====="
+          ls -lh "oss-fuzz/build/out/yyjson/${NEW_TARGET}_seed_corpus.zip"
+
+      - name: Check AFL++ build
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py check_build \
+            --engine afl \
+            --sanitizer=${{ inputs.sanitizer }} \
+            yyjson "$NEW_TARGET"
+
+      - name: Prepare AFL++ input corpus
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/corpus/input"
+
+          unzip -oq \
+            "$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/${NEW_TARGET}_seed_corpus.zip" \
+            -d "$GITHUB_WORKSPACE/corpus/input"
+
+          echo "===== input corpus ====="
+          find "$GITHUB_WORKSPACE/corpus/input" -type f | sort | head -50 || true
+          echo "Input corpus file count:"
+          find "$GITHUB_WORKSPACE/corpus/input" -type f | wc -l
+
+      - name: Run AFL++ 5h parallel fuzzing
+        id: fuzz
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+          set +e
+
+          docker run \
+            --privileged \
+            --shm-size=2g \
+            --platform linux/amd64 \
+            --rm \
+            -e AFL_SANITIZER="${{ inputs.sanitizer }}" \
+            -e AFL_DURATION_SECONDS="$AFL_DURATION_SECONDS" \
+            -e NEW_TARGET="$NEW_TARGET" \
+            -e MAX_INPUT_SIZE="$MAX_INPUT_SIZE" \
+            -e AFL_NO_UI=1 \
+            -v "$GITHUB_WORKSPACE/corpus/input:/corpus/input:ro" \
+            -v "$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson:/out" \
+            gcr.io/oss-fuzz-base/base-runner:latest \
+            /bin/bash -lc '
+              set +e
+
+              AFL_OUT="/out/${NEW_TARGET}_afl_${AFL_SANITIZER}_out"
+              AFL_LOG_DIR="/out/${NEW_TARGET}_afl_${AFL_SANITIZER}_logs"
+
+              echo "===== clean previous AFL++ output once ====="
+              rm -rf "$AFL_OUT" "$AFL_LOG_DIR"
+              mkdir -p "$AFL_OUT" "$AFL_LOG_DIR"
+
+              echo "===== OSS-Fuzz AFL++ environment ====="
+              export ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=1:symbolize=0:detect_odr_violation=0:"
+              export MSAN_OPTIONS="$MSAN_OPTIONS:exit_code=86:symbolize=0"
+              export UBSAN_OPTIONS="$UBSAN_OPTIONS:symbolize=0"
+              export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+              export AFL_SKIP_CPUFREQ=1
+              export AFL_TRY_AFFINITY=1
+              export AFL_FAST_CAL=1
+              export AFL_CMPLOG_ONLY_NEW=1
+              export AFL_FORKSRV_INIT_TMOUT=30000
+              export AFL_IGNORE_PROBLEMS=1
+              export AFL_IGNORE_UNKNOWN_ENVS=1
+              export AFL_INPUT_LEN_MAX="$MAX_INPUT_SIZE"
+
+              echo "ASAN_OPTIONS=$ASAN_OPTIONS"
+              echo "MSAN_OPTIONS=$MSAN_OPTIONS"
+              echo "UBSAN_OPTIONS=$UBSAN_OPTIONS"
+
+              echo "===== AFL++ parallel configuration ====="
+              echo "AFL_OUT=$AFL_OUT"
+              echo "AFL_LOG_DIR=$AFL_LOG_DIR"
+              echo "AFL_DURATION_SECONDS=$AFL_DURATION_SECONDS"
+              echo "AFL_SANITIZER=$AFL_SANITIZER"
+              echo "NEW_TARGET=$NEW_TARGET"
+              echo "MAX_INPUT_SIZE=$MAX_INPUT_SIZE"
+
+              echo "===== target files ====="
+              ls -lh "/out/$NEW_TARGET"
+              ls -lh /out/afl-fuzz
+              ls -lh "/out/${NEW_TARGET}.dict"
+
+              echo "Input corpus count:"
+              find /corpus/input -type f | wc -l
+
+              echo "===== starting main ====="
+              (
+                set +e
+                /out/afl-fuzz \
+                  -t 5000+ \
+                  -G "$MAX_INPUT_SIZE" \
+                  -i /corpus/input \
+                  -o "$AFL_OUT" \
+                  -x "/out/${NEW_TARGET}.dict" \
+                  -V "$AFL_DURATION_SECONDS" \
+                  -M main \
+                  -- "/out/$NEW_TARGET" \
+                  2>&1 | tee "$AFL_LOG_DIR/main.log"
+
+                exit "${PIPESTATUS[0]}"
+              ) &
+              pid_main=$!
+
+              sleep 20
+
+              echo "===== starting secondary01 ====="
+              (
+                set +e
+                /out/afl-fuzz \
+                  -t 5000+ \
+                  -G "$MAX_INPUT_SIZE" \
+                  -i /corpus/input \
+                  -o "$AFL_OUT" \
+                  -x "/out/${NEW_TARGET}.dict" \
+                  -V "$AFL_DURATION_SECONDS" \
+                  -S secondary01 \
+                  -- "/out/$NEW_TARGET" \
+                  > "$AFL_LOG_DIR/secondary01.log" 2>&1
+
+                exit "$?"
+              ) &
+              pid_secondary01=$!
+
+              echo "===== starting secondary02 ====="
+              (
+                set +e
+                /out/afl-fuzz \
+                  -t 5000+ \
+                  -G "$MAX_INPUT_SIZE" \
+                  -i /corpus/input \
+                  -o "$AFL_OUT" \
+                  -x "/out/${NEW_TARGET}.dict" \
+                  -V "$AFL_DURATION_SECONDS" \
+                  -S secondary02 \
+                  -- "/out/$NEW_TARGET" \
+                  > "$AFL_LOG_DIR/secondary02.log" 2>&1
+
+                exit "$?"
+              ) &
+              pid_secondary02=$!
+
+              wait "$pid_main"
+              status_main=$?
+
+              wait "$pid_secondary01"
+              status_secondary01=$?
+
+              wait "$pid_secondary02"
+              status_secondary02=$?
+
+              echo "main=$status_main" | tee "$AFL_LOG_DIR/parallel_exit_summary.txt"
+              echo "secondary01=$status_secondary01" | tee -a "$AFL_LOG_DIR/parallel_exit_summary.txt"
+              echo "secondary02=$status_secondary02" | tee -a "$AFL_LOG_DIR/parallel_exit_summary.txt"
+
+              echo "===== AFL++ output tree ====="
+              find "$AFL_OUT" -maxdepth 3 -type d | sort || true
+
+              exit 0
+            '
+
+          docker_status=$?
+
+          AFL_OUT="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_out"
+          AFL_LOG_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_logs"
+
+          echo "===== fix AFL++ output permissions ====="
+          echo "AFL_OUT=$AFL_OUT"
+          echo "AFL_LOG_DIR=$AFL_LOG_DIR"
+
+          sudo chown -R "$USER:$USER" "$AFL_OUT" "$AFL_LOG_DIR" 2>/dev/null || true
+          sudo chmod -R u+rwX "$AFL_OUT" "$AFL_LOG_DIR" 2>/dev/null || true
+
+          echo "===== AFL++ output after permission fix ====="
+          find "$AFL_OUT" -maxdepth 3 -type f | head -100 || true
+
+          echo "docker_status=$docker_status" | tee "$GITHUB_WORKSPACE/logs/docker_status.txt"
+
+          if [ -d "$AFL_LOG_DIR" ]; then
+            cp "$AFL_LOG_DIR"/*.log "$GITHUB_WORKSPACE/logs/" 2>/dev/null || true
+            cp "$AFL_LOG_DIR"/parallel_exit_summary.txt "$GITHUB_WORKSPACE/logs/" 2>/dev/null || true
+          fi
+
+          status_main=1
+          status_secondary01=1
+          status_secondary02=1
+
+          if [ -f "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" ]; then
+            status_main=$(grep "^main=" "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" | cut -d= -f2)
+            status_secondary01=$(grep "^secondary01=" "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" | cut -d= -f2)
+            status_secondary02=$(grep "^secondary02=" "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" | cut -d= -f2)
+          fi
+
+          echo "main=$status_main"
+          echo "secondary01=$status_secondary01"
+          echo "secondary02=$status_secondary02"
+
+          if [ "$docker_status" -ne 0 ] || [ "$status_main" -ne 0 ] || [ "$status_secondary01" -ne 0 ] || [ "$status_secondary02" -ne 0 ]; then
+            echo "afl_status=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "afl_status=success" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit 0
+
+      - name: Extract AFL++ queues
+        id: extract_queue
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/afl-raw-queue"
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+          AFL_OUT="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_out"
+          RAW_QUEUE="$GITHUB_WORKSPACE/afl-raw-queue"
+
+          echo "===== extract AFL++ queue files ====="
+          echo "AFL_OUT=$AFL_OUT"
+          echo "RAW_QUEUE=$RAW_QUEUE"
+
+          echo "===== AFL++ output tree ====="
+          sudo find "$AFL_OUT" -maxdepth 4 -print | sort || true
+
+          raw_count=0
+
+          if [ ! -d "$AFL_OUT" ]; then
+            echo "AFL++ output directory not found."
+            echo "raw_queue_count=0" | tee "$GITHUB_WORKSPACE/logs/queue_summary.txt"
+            echo "raw_queue_count=0" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          for qdir in "$AFL_OUT"/*/queue; do
+            if sudo test -d "$qdir"; then
+              inst_name="$(basename "$(dirname "$qdir")")"
+              echo "Collecting queue from $inst_name"
+
+              while IFS= read -r f; do
+                sudo cp "$f" "$RAW_QUEUE/${inst_name}_${raw_count}"
+                raw_count=$((raw_count + 1))
+              done < <(sudo find "$qdir" -type f -name "id:*" | sort)
+            fi
+          done
+
+          sudo chown -R "$USER:$USER" "$RAW_QUEUE"
+          chmod -R u+rwX "$RAW_QUEUE"
+
+          echo "raw_queue_count=$raw_count" | tee "$GITHUB_WORKSPACE/logs/queue_summary.txt"
+          echo "raw_queue_count=$raw_count" >> "$GITHUB_OUTPUT"
+
+          echo "Raw queue file count:"
+          find "$RAW_QUEUE" -type f | wc -l
+
+          if [ "$raw_count" -eq 0 ]; then
+            echo "No AFL++ queue files were extracted. Refusing to generate misleading coverage report."
+            exit 1
+          fi
+
+      - name: Minimize AFL++ queue by coverage
+        id: cmin
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/coverage-corpus/$NEW_TARGET"
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+          RAW_QUEUE="$GITHUB_WORKSPACE/afl-raw-queue"
+          MIN_CORPUS="$GITHUB_WORKSPACE/coverage-corpus/$NEW_TARGET"
+
+          echo "===== minimize AFL++ queue ====="
+          echo "RAW_QUEUE=$RAW_QUEUE"
+          echo "MIN_CORPUS=$MIN_CORPUS"
+
+          if [ ! -d "$RAW_QUEUE" ] || [ "$(find "$RAW_QUEUE" -type f | wc -l)" -eq 0 ]; then
+            echo "No raw queue files. Cannot minimize."
+            exit 1
+          fi
+
+          docker run \
+            --privileged \
+            --shm-size=2g \
+            --platform linux/amd64 \
+            --rm \
+            -e NEW_TARGET="$NEW_TARGET" \
+            -v "$RAW_QUEUE:/raw_queue:ro" \
+            -v "$MIN_CORPUS:/min_corpus" \
+            -v "$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson:/out" \
+            gcr.io/oss-fuzz-base/base-runner:latest \
+            /bin/bash -lc '
+              set +e
+
+              echo "===== OSS-Fuzz AFL++ environment for afl-cmin ====="
+              export ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=1:symbolize=0:detect_odr_violation=0:"
+              export MSAN_OPTIONS="$MSAN_OPTIONS:exit_code=86:symbolize=0"
+              export UBSAN_OPTIONS="$UBSAN_OPTIONS:symbolize=0"
+              export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+              export AFL_SKIP_CPUFREQ=1
+              export AFL_TRY_AFFINITY=1
+              export AFL_FAST_CAL=1
+              export AFL_CMPLOG_ONLY_NEW=1
+              export AFL_FORKSRV_INIT_TMOUT=30000
+              export AFL_IGNORE_PROBLEMS=1
+              export AFL_IGNORE_UNKNOWN_ENVS=1
+
+              echo "===== check afl-cmin ====="
+              ls -lh /out/afl-cmin || true
+
+              if [ -x /out/afl-cmin ]; then
+                echo "Using afl-cmin for coverage-equivalent corpus minimization."
+
+                /out/afl-cmin \
+                  -t 5000 \
+                  -i /raw_queue \
+                  -o /min_corpus \
+                  -- "/out/$NEW_TARGET"
+
+                cmin_status=$?
+                echo "afl_cmin_status=$cmin_status"
+
+                if [ "$cmin_status" -ne 0 ]; then
+                  echo "afl-cmin failed. Falling back to hash-based deduplication."
+                  rm -rf /min_corpus/*
+                  for f in /raw_queue/*; do
+                    [ -f "$f" ] || continue
+                    sha=$(sha256sum "$f" | awk "{print \$1}")
+                    if [ ! -f "/min_corpus/$sha" ]; then
+                      cp "$f" "/min_corpus/$sha"
+                    fi
+                  done
+                fi
+              else
+                echo "afl-cmin not found. Falling back to hash-based deduplication."
+                rm -rf /min_corpus/*
+                for f in /raw_queue/*; do
+                  [ -f "$f" ] || continue
+                  sha=$(sha256sum "$f" | awk "{print \$1}")
+                  if [ ! -f "/min_corpus/$sha" ]; then
+                    cp "$f" "/min_corpus/$sha"
+                  fi
+                done
+              fi
+
+              echo "Minimized corpus count:"
+              find /min_corpus -type f | wc -l
+
+              exit 0
+            '
+
+          min_count=$(find "$MIN_CORPUS" -type f | wc -l | tr -d ' ')
+          echo "minimized_corpus_count=$min_count" | tee -a "$GITHUB_WORKSPACE/logs/queue_summary.txt"
+          echo "minimized_corpus_count=$min_count" >> "$GITHUB_OUTPUT"
+
+          echo "===== minimized corpus sample ====="
+          find "$MIN_CORPUS" -type f | head -50 || true
+
+      - name: Collect essential AFL++ output
+        id: collect
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results"
+          mkdir -p "$GITHUB_WORKSPACE/results/essential"
+
+          AFL_OUT="$GITHUB_WORKSPACE/oss-fuzz/build/out/yyjson/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_out"
+          ESSENTIAL_DIR="$GITHUB_WORKSPACE/results/essential"
+          ESSENTIAL_TAR="$GITHUB_WORKSPACE/results/${NEW_TARGET}_afl_${{ inputs.sanitizer }}_parallel_5h_essential.tar.gz"
+
+          echo "===== AFL++ output directory ====="
+          echo "$AFL_OUT"
+
+          echo "===== parallel exit summary ====="
+          cat "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" || true
+
+          echo "===== docker status ====="
+          cat "$GITHUB_WORKSPACE/logs/docker_status.txt" || true
+
+          echo "===== queue summary ====="
+          cat "$GITHUB_WORKSPACE/logs/queue_summary.txt" || true
+
+          echo "===== log tails ====="
+          echo "--- main ---"
+          tail -n 100 "$GITHUB_WORKSPACE/logs/main.log" || true
+          echo "--- secondary01 ---"
+          tail -n 100 "$GITHUB_WORKSPACE/logs/secondary01.log" || true
+          echo "--- secondary02 ---"
+          tail -n 100 "$GITHUB_WORKSPACE/logs/secondary02.log" || true
+
+          if [ -d "$AFL_OUT" ]; then
+            echo "Found AFL++ output directory."
+            du -sh "$AFL_OUT" || true
+            find "$AFL_OUT" -maxdepth 2 -type d | sort || true
+
+            crash_count=$(find "$AFL_OUT" -path "*/crashes/*" -type f ! -name README.txt | wc -l | tr -d ' ')
+            hang_count=$(find "$AFL_OUT" -path "*/hangs/*" -type f ! -name README.txt | wc -l | tr -d ' ')
+
+            echo "crash_count=$crash_count" | tee "$GITHUB_WORKSPACE/logs/finding_summary.txt"
+            echo "hang_count=$hang_count" | tee -a "$GITHUB_WORKSPACE/logs/finding_summary.txt"
+
+            echo "crash_count=$crash_count" >> "$GITHUB_OUTPUT"
+            echo "hang_count=$hang_count" >> "$GITHUB_OUTPUT"
+
+            for inst in "$AFL_OUT"/*; do
+              if [ -d "$inst" ]; then
+                inst_name="$(basename "$inst")"
+                mkdir -p "$ESSENTIAL_DIR/$inst_name"
+
+                sudo test -f "$inst/fuzzer_stats" && sudo cp "$inst/fuzzer_stats" "$ESSENTIAL_DIR/$inst_name/fuzzer_stats" || true
+                sudo test -f "$inst/plot_data" && sudo cp "$inst/plot_data" "$ESSENTIAL_DIR/$inst_name/plot_data" || true
+                sudo test -f "$inst/fastresume.bin" && sudo cp "$inst/fastresume.bin" "$ESSENTIAL_DIR/$inst_name/fastresume.bin" || true
+
+                if sudo test -d "$inst/crashes"; then
+                  mkdir -p "$ESSENTIAL_DIR/$inst_name/crashes"
+                  sudo cp -R "$inst/crashes/." "$ESSENTIAL_DIR/$inst_name/crashes/" 2>/dev/null || true
+                fi
+
+                if sudo test -d "$inst/hangs"; then
+                  mkdir -p "$ESSENTIAL_DIR/$inst_name/hangs"
+                  sudo cp -R "$inst/hangs/." "$ESSENTIAL_DIR/$inst_name/hangs/" 2>/dev/null || true
+                fi
+              fi
+            done
+
+            cp "$GITHUB_WORKSPACE/logs/finding_summary.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
+            cp "$GITHUB_WORKSPACE/logs/parallel_exit_summary.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
+            cp "$GITHUB_WORKSPACE/logs/docker_status.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
+            cp "$GITHUB_WORKSPACE/logs/queue_summary.txt" "$ESSENTIAL_DIR/" 2>/dev/null || true
+
+            sudo chown -R "$USER:$USER" "$ESSENTIAL_DIR"
+
+            tar -czf "$ESSENTIAL_TAR" -C "$GITHUB_WORKSPACE/results" essential
+            ls -lh "$GITHUB_WORKSPACE/results"
+          else
+            echo "AFL++ output directory not found."
+
+            echo "crash_count=0" >> "$GITHUB_OUTPUT"
+            echo "hang_count=0" >> "$GITHUB_OUTPUT"
+
+            echo "crash_count=0" | tee "$GITHUB_WORKSPACE/logs/finding_summary.txt"
+            echo "hang_count=0" | tee -a "$GITHUB_WORKSPACE/logs/finding_summary.txt"
+          fi
+
+      - name: Build coverage fuzzers
+        run: |
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers \
+            --sanitizer=coverage \
+            --clean \
+            yyjson "$GITHUB_WORKSPACE/yyjson-local"
+
+          echo "===== coverage build output ====="
+          ls -lh build/out/yyjson
+
+      - name: Generate source coverage for new target using minimized AFL++ corpus
+        id: coverage_new
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/coverage-results"
+
+          MIN_CORPUS="$GITHUB_WORKSPACE/coverage-corpus/$NEW_TARGET"
+
+          echo "===== minimized corpus for coverage ====="
+          echo "$MIN_CORPUS"
+          find "$MIN_CORPUS" -type f | head -50 || true
+          min_count=$(find "$MIN_CORPUS" -type f | wc -l | tr -d ' ')
+          echo "Minimized corpus count: $min_count"
+
+          if [ "$min_count" -eq 0 ]; then
+            echo "No minimized corpus files. Refusing to generate misleading coverage."
+            exit 1
+          fi
+
+          cd oss-fuzz
+
+          python3 infra/helper.py coverage \
+            --no-corpus-download \
+            --no-serve \
+            --fuzz-target="$NEW_TARGET" \
+            --corpus-dir="$MIN_CORPUS" \
+            yyjson
+
+          rm -rf "$GITHUB_WORKSPACE/coverage-results/${NEW_TARGET}_afl_queue_report"
+          cp -R build/out/yyjson/report "$GITHUB_WORKSPACE/coverage-results/${NEW_TARGET}_afl_queue_report"
+
+      - name: Generate source coverage for existing target
+        id: coverage_existing
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/coverage-results"
+
+          cd oss-fuzz
+
+          if [ ! -x "build/out/yyjson/$EXISTING_TARGET" ]; then
+            echo "Existing target '$EXISTING_TARGET' not found. Skipping existing target coverage."
+            echo "existing_target_coverage=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 infra/helper.py coverage \
+            --no-serve \
+            --fuzz-target="$EXISTING_TARGET" \
+            yyjson
+
+          rm -rf "$GITHUB_WORKSPACE/coverage-results/${EXISTING_TARGET}_report"
+          cp -R build/out/yyjson/report "$GITHUB_WORKSPACE/coverage-results/${EXISTING_TARGET}_report"
+
+          echo "existing_target_coverage=generated" >> "$GITHUB_OUTPUT"
+
+      - name: Create coverage summary
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/coverage-results"
+
+          {
+            echo "yyjson JSON Merge Patch AFL++ 5h parallel fuzzing with source coverage"
+            echo
+            echo "AFL duration seconds: $AFL_DURATION_SECONDS"
+            echo "AFL queue generation sanitizer: ${{ inputs.sanitizer }}"
+            echo "Max input size: $MAX_INPUT_SIZE"
+            echo "New target: $NEW_TARGET"
+            echo "Existing target: $EXISTING_TARGET"
+            echo
+            echo "Queue summary:"
+            cat "$GITHUB_WORKSPACE/logs/queue_summary.txt" 2>/dev/null || true
+            echo
+            echo "Finding summary:"
+            cat "$GITHUB_WORKSPACE/logs/finding_summary.txt" 2>/dev/null || true
+            echo
+            echo "Coverage result directories:"
+            find "$GITHUB_WORKSPACE/coverage-results" -maxdepth 2 -type d | sort || true
+          } > "$GITHUB_WORKSPACE/coverage-results/summary.txt"
+
+          cat "$GITHUB_WORKSPACE/coverage-results/summary.txt"
+
+      - name: Upload fuzzing and coverage results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yyjson-merge-patch-afl-${{ inputs.sanitizer }}-parallel-5h-coverage
+          path: |
+            logs
+            results/*essential.tar.gz
+            coverage-results
+          retention-days: 7
+          compression-level: 0
+
+      - name: Fail if AFL++ returned non-zero
+        if: steps.fuzz.outputs.afl_status == 'failed'
+        run: |
+          echo "At least one AFL++ instance returned non-zero. Check uploaded logs and results."
+          exit 1
+
+      - name: Fail if crashes or hangs were found
+        if: steps.collect.outputs.crash_count != '0' || steps.collect.outputs.hang_count != '0'
+        run: |
+          echo "AFL++ found crashes or hangs."
+          echo "crash_count=${{ steps.collect.outputs.crash_count }}"
+          echo "hang_count=${{ steps.collect.outputs.hang_count }}"
+          echo "Download the uploaded artifact and inspect crashes/hangs."
+          exit 1

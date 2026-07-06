@@ -1,6 +1,6 @@
 #include <yyjson.h>
 
-#define YYJSON_PATCH_MAX_INPUT_SIZE 8192
+#define YYJSON_MERGE_PATCH_MAX_INPUT_SIZE 8192
 
 static void write_and_free_mut_val(yyjson_mut_val *val) {
     if (val == NULL) {
@@ -9,8 +9,9 @@ static void write_and_free_mut_val(yyjson_mut_val *val) {
 
     /*
      * Serialize the produced mutable value to traverse the result tree.
-     * This is used as a lightweight consistency check. If a patch operation
-     * produces a structurally invalid tree, this traversal may expose it.
+     * This is used as a lightweight consistency check. If a merge patch
+     * operation produces a structurally invalid tree, this traversal may
+     * expose it.
      */
     size_t len = 0;
     char *json = yyjson_mut_val_write(val, YYJSON_WRITE_NOFLAG, &len);
@@ -19,7 +20,7 @@ static void write_and_free_mut_val(yyjson_mut_val *val) {
     }
 }
 
-static void run_json_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
+static void run_json_merge_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
     yyjson_val *base_root = yyjson_doc_get_root(base_doc);
     yyjson_val *patch_root = yyjson_doc_get_root(patch_doc);
 
@@ -28,22 +29,19 @@ static void run_json_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
     }
 
     /*
-     * JSON Patch with immutable input values.
+     * JSON Merge Patch with immutable input values.
      */
     yyjson_mut_doc *result_doc = yyjson_mut_doc_new(NULL);
     if (result_doc != NULL) {
-        yyjson_patch_err err;
-        memset(&err, 0, sizeof(err));
-
         yyjson_mut_val *result =
-            yyjson_patch(result_doc, base_root, patch_root, &err);
+            yyjson_merge_patch(result_doc, base_root, patch_root);
         write_and_free_mut_val(result);
 
         yyjson_mut_doc_free(result_doc);
     }
 
     /*
-     * JSON Patch with mutable input values.
+     * JSON Merge Patch with mutable input values.
      * Both arguments are copied into the mutable document, because the mutable
      * API expects yyjson_mut_val inputs.
      */
@@ -53,11 +51,8 @@ static void run_json_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
         yyjson_mut_val *patch_mut = yyjson_val_mut_copy(mut_doc, patch_root);
 
         if (base_mut != NULL && patch_mut != NULL) {
-            yyjson_patch_err err;
-            memset(&err, 0, sizeof(err));
-
             yyjson_mut_val *result =
-                yyjson_mut_patch(mut_doc, base_mut, patch_mut, &err);
+                yyjson_mut_merge_patch(mut_doc, base_mut, patch_mut);
             write_and_free_mut_val(result);
         }
 
@@ -68,14 +63,14 @@ static void run_json_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (data == NULL ||
         size < sizeof(uint16_t) + 1 ||
-        size > YYJSON_PATCH_MAX_INPUT_SIZE) {
+        size > YYJSON_MERGE_PATCH_MAX_INPUT_SIZE) {
         return 0;
     }
 
     /*
      * Split the input into:
      *   - base JSON document
-     *   - JSON Patch document
+     *   - JSON Merge Patch document
      *
      * The first two bytes select the split point.
      */
@@ -101,7 +96,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         yyjson_read_opts((char *)(void *)patch_data, patch_size, flags, NULL, NULL);
 
     if (base_doc != NULL && patch_doc != NULL) {
-        run_json_patch(base_doc, patch_doc);
+        run_json_merge_patch(base_doc, patch_doc);
     }
 
     yyjson_doc_free(base_doc);
