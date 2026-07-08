@@ -7,12 +7,6 @@ static void write_and_free_mut_val(yyjson_mut_val *val) {
         return;
     }
 
-    /*
-     * Serialize the produced mutable value to traverse the result tree.
-     * This is used as a lightweight consistency check. If a merge patch
-     * operation produces a structurally invalid tree, this traversal may
-     * expose it.
-     */
     size_t len = 0;
     char *json = yyjson_mut_val_write(val, YYJSON_WRITE_NOFLAG, &len);
     if (json != NULL) {
@@ -28,9 +22,6 @@ static void run_json_merge_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
         return;
     }
 
-    /*
-     * JSON Merge Patch with immutable input values.
-     */
     yyjson_mut_doc *result_doc = yyjson_mut_doc_new(NULL);
     if (result_doc != NULL) {
         yyjson_mut_val *result =
@@ -40,11 +31,6 @@ static void run_json_merge_patch(yyjson_doc *base_doc, yyjson_doc *patch_doc) {
         yyjson_mut_doc_free(result_doc);
     }
 
-    /*
-     * JSON Merge Patch with mutable input values.
-     * Both arguments are copied into the mutable document, because the mutable
-     * API expects yyjson_mut_val inputs.
-     */
     yyjson_mut_doc *mut_doc = yyjson_mut_doc_new(NULL);
     if (mut_doc != NULL) {
         yyjson_mut_val *base_mut = yyjson_val_mut_copy(mut_doc, base_root);
@@ -67,13 +53,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         return 0;
     }
 
-    /*
-     * Split the input into:
-     *   - base JSON document
-     *   - JSON Merge Patch document
-     *
-     * The first two bytes select the split point.
-     */
     uint16_t split_len_raw;
     memcpy(&split_len_raw, data, sizeof(split_len_raw));
 
